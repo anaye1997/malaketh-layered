@@ -1,20 +1,22 @@
 use bytes::Bytes;
 use color_eyre::eyre::{self, eyre};
 use ssz::{Decode, Encode};
+use std::time::Duration;
 use tracing::{debug, error, info};
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
+use malachitebft_app_channel::app::engine::host::Next;
 use malachitebft_app_channel::app::streaming::StreamContent;
 use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{Round, Validity};
 use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
-use malachitebft_app_channel::{AppMsg, Channels, ConsensusMsg, NetworkMsg};
-use tokio::sync::mpsc::Receiver;
+use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
-use malachitebft_eth_types::{Block, BlockHash, TestContext};
+use malachitebft_eth_types::{Block, BlockHash, TestContext, Height};
+use tokio::sync::mpsc::Receiver;
 
 use crate::state::{decode_value, State};
 
@@ -22,6 +24,7 @@ pub async fn run(
     state: &mut State,
     channels: &mut Channels<TestContext>,
     engine: Engine,
+    block_interval: Duration,
     mut shutdown_rx: Receiver<()>,
 ) -> eyre::Result<()> {
     let mut shutdown_flag = false;
@@ -34,7 +37,17 @@ pub async fn run(
                     // The first message to handle is the `ConsensusReady` message, signaling to the app
                     // that Malachite is ready to start consensus
                     AppMsg::ConsensusReady { reply } => {
-                        info!("🟢🟢 Consensus is ready");
+                        if state.current_height <= Height::default() {
+                            let start_height = state
+                            .max_decided_value_height()
+                            .await
+                            .map(|height| height.increment())
+                            .unwrap_or_else(|| Height::new(1));
+
+                            state.set_current_height(start_height).await;
+                        }
+
+                        info!("🟢🟢 Consensus is ready!!! start_height: {:?}", state.current_height);
 
                         // Node start-up: https://hackmd.io/@danielrachi/engine_api#Node-startup
                         // Check compatibility with execution client
@@ -47,12 +60,9 @@ pub async fn run(
 
                         // We can simply respond by telling the engine to start consensus
                         // at the current height, which is initially 1
-                        if reply
-                            .send(ConsensusMsg::StartHeight(
-                                state.current_height,
-                                state.get_validator_set().clone(),
-                            ))
-                            .is_err()
+                        if reply.send(
+                            (state.current_height, state.get_validator_set(state.current_height).clone())
+                        ).is_err()
                         {
                             error!("Failed to send ConsensusReady reply");
                         }
@@ -64,13 +74,18 @@ pub async fn run(
                         height,
                         round,
                         proposer,
+                        role,
+                        ..
                     } => {
-                        info!(%height, %round, %proposer, "🟢🟢 Started round");
+                        info!(%height, %round, %proposer, ?role, "🟢🟢 Started round");
 
                         // We can use that opportunity to update our internal state
                         state.current_height = height;
                         state.current_round = round;
                         state.current_proposer = Some(proposer);
+
+                        // todo support
+                        // https://github.com/informalsystems/malachite/commit/6840ae388f7a9ea63b8de4b9b2087be7274bc78d
                     }
 
                     // At some point, we may end up being the proposer for that round, and the consensus engine
@@ -103,7 +118,7 @@ pub async fn run(
 
                         // When the node is not the proposer, store the block data,
                         // which will be passed to the execution client (EL) on commit.
-                        state.store_undecided_proposal_data(bytes.clone()).await?;
+                        state.store_undecided_proposal_data(height, state.current_round, bytes.clone()).await?;
 
                         // Send it to consensus
                         if reply.send(proposal.clone()).is_err() {
@@ -154,8 +169,8 @@ pub async fn run(
                     //
                     // In our case, our validator set stays constant between heights so we can
                     // send back the validator set found in our genesis state.
-                    AppMsg::GetValidatorSet { height: _, reply } => {
-                        if reply.send(state.get_validator_set().clone()).is_err() {
+                    AppMsg::GetValidatorSet { height, reply } => {
+                        if reply.send(Some(state.get_validator_set(height).clone())).is_err() {
                             error!("🔴 Failed to send GetValidatorSet reply");
                         }
                     }
@@ -229,6 +244,8 @@ pub async fn run(
                         let payload_status = engine
                             .notify_new_block(execution_payload, versioned_hashes)
                             .await?;
+                        // Simulated Execution Time
+                        // tokio::time::sleep(Duration::from_millis(500)).await;
                         if payload_status.status.is_invalid() {
                             return Err(eyre!("Invalid payload status: {}", payload_status.status));
                         }
@@ -248,7 +265,12 @@ pub async fn run(
                         // When that happens, we store the decided value in our store
                         state.commit(certificate).await?;
 
+                        // Pause briefly before starting next height, just to make following the logs easier
+                        // tokio::time::sleep(Duration::from_millis(500)).await;
+                        engine.sleep_for_block_interval(state.latest_block_timestamp, block_interval).await;
+
                         // Save the latest block
+                        state.latest_block_timestamp = new_block_timestamp*1000;
                         state.latest_block = Some(ExecutionBlock {
                             block_hash: new_block_hash,
                             block_number: new_block_number,
@@ -257,14 +279,11 @@ pub async fn run(
                             prev_randao: new_block_prev_randao,
                         });
 
-                        // Pause briefly before starting next height, just to make following the logs easier
-                        // tokio::time::sleep(Duration::from_millis(500)).await;
-
                         // And then we instruct consensus to start the next height
                         if reply
-                            .send(ConsensusMsg::StartHeight(
+                            .send(Next::Start(
                                 state.current_height,
-                                state.get_validator_set().clone(),
+                                state.get_validator_set(state.current_height).clone(),
                             ))
                             .is_err()
                         {
@@ -289,20 +308,24 @@ pub async fn run(
                     } => {
                         info!(%height, %round, "🟢🟢 Processing synced value");
 
-                        let value = decode_value(value_bytes);
-
-                        // We send to consensus to see if it has been decided on
-                        if reply
-                            .send(ProposedValue {
+                        if let Some(value) = decode_value(value_bytes.clone()){
+                            let block_bytes = value.extensions.clone();
+                            let proposed_value = ProposedValue {
                                 height,
                                 round,
                                 valid_round: Round::Nil,
                                 proposer,
                                 value,
                                 validity: Validity::Valid,
-                            })
-                            .is_err()
-                        {
+                            };
+                            state.store_undecided_proposal(proposed_value.clone()).await?;
+                            state.store_undecided_proposal_data(height, round, block_bytes).await?;
+
+                            // We send to consensus to see if it has been decided on
+                            if reply.send(Some(proposed_value)).is_err() {
+                                error!("Failed to send ProcessSyncedValue reply");
+                            }
+                        } else if reply.send(None).is_err() {
                             error!("Failed to send ProcessSyncedValue reply");
                         }
                     }
@@ -350,20 +373,6 @@ pub async fn run(
                         if reply.send(Ok(())).is_err() {
                             error!("🔴 Failed to send VerifyVoteExtension reply");
                         }
-                    }
-
-                    AppMsg::PeerJoined { peer_id } => {
-                        info!(%peer_id, "🟢🟢 Peer joined our local view of network");
-
-                        // You might want to track connected peers in your state
-                        state.peers.insert(peer_id);
-                    }
-
-                    AppMsg::PeerLeft { peer_id } => {
-                        info!(%peer_id, "🔴 Peer left our local view of network");
-
-                        // Remove the peer from tracking
-                        state.peers.remove(&peer_id);
                     }
                 }
             }

@@ -1,10 +1,6 @@
 //! Internal state of the application. This is a simplified abstract to keep it simple.
 //! A regular application would have mempool implemented, a proper database and input methods like RPC.
-
-use std::collections::HashSet;
-
 use bytes::Bytes;
-use color_eyre::eyre;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha3::Digest;
@@ -23,7 +19,8 @@ use malachitebft_eth_types::{
     ProposalPart, TestContext, ValidatorSet, Value,
 };
 
-use crate::store::{DecidedValue, Store};
+use crate::app_config::PruneConfig;
+use crate::store::{DecidedValue, Store, StoreError};
 use crate::streaming::{PartStreamsMap, ProposalParts};
 
 /// Size of randomly generated blocks in bytes
@@ -47,12 +44,16 @@ pub struct State {
     #[allow(dead_code)]
     rng: StdRng,
 
+    // Prune configuration
+    pub prune_config: PruneConfig,
+
     pub current_height: Height,
     pub current_round: Round,
     pub current_proposer: Option<Address>,
-    pub peers: HashSet<PeerId>,
-
+    // pub peers: HashSet<PeerId>,
     pub latest_block: Option<ExecutionBlock>,
+    // Timestamp of the latest block in milliseconds
+    pub latest_block_timestamp: u64,
 
     // For stats
     pub txs_count: u64,
@@ -94,6 +95,7 @@ impl State {
         address: Address,
         height: Height,
         store: Store,
+        prune_config: PruneConfig,
     ) -> Self {
         Self {
             genesis,
@@ -107,14 +109,24 @@ impl State {
             stream_nonce: 0,
             streams_map: PartStreamsMap::new(),
             rng: StdRng::seed_from_u64(seed_from_address(&address)),
-            peers: HashSet::new(),
-
+            prune_config,
+            // peers: HashSet::new(),
             latest_block: None,
+            latest_block_timestamp: 0,
 
             txs_count: 0,
             chain_bytes: 0,
             start_time: Instant::now(),
         }
+    }
+
+    /// sets the current height of the state
+    pub async fn set_current_height(&mut self, height: Height) {
+        self.current_height = height;
+    }
+
+    pub async fn max_decided_value_height(&self) -> Option<Height> {
+        self.store.max_decided_value_height().await
     }
 
     /// Returns the earliest height available in the state
@@ -165,7 +177,7 @@ impl State {
         }
 
         // Re-assemble the proposal from its parts
-        let (value, data) = assemble_value_from_parts(parts);
+        let (value, data) = assemble_value_from_parts(parts.clone());
 
         // Log first 32 bytes of proposal data and total size
         if data.len() >= 32 {
@@ -179,16 +191,29 @@ impl State {
 
         // Store the proposal and its data
         self.store.store_undecided_proposal(value.clone()).await?;
-        self.store_undecided_proposal_data(data).await?;
+        self.store_undecided_proposal_data(parts.height, self.current_round, data)
+            .await?;
 
         Ok(Some(value))
     }
 
-    pub async fn store_undecided_proposal_data(&mut self, data: Bytes) -> eyre::Result<()> {
+    pub async fn store_undecided_proposal_data(
+        &mut self,
+        height: Height,
+        round: Round,
+        data: Bytes,
+    ) -> eyre::Result<()> {
         self.store
-            .store_undecided_block_data(self.current_height, self.current_round, data)
+            .store_undecided_block_data(height, round, data)
             .await
             .map_err(|e| eyre::Report::new(e))
+    }
+
+    pub async fn store_undecided_proposal(
+        &self,
+        value: ProposedValue<TestContext>,
+    ) -> Result<(), StoreError> {
+        self.store.store_undecided_proposal(value).await
     }
 
     /// Retrieves a decided block at the given height
@@ -259,9 +284,23 @@ impl State {
                 .await?;
         }
 
-        // Prune the store, keep the last 5 heights
-        let retain_height = Height::new(certificate.height.as_u64().saturating_sub(5));
-        self.store.prune(retain_height).await?;
+        // Prune the store based on configuration
+        if self.prune_config.enabled {
+            let retain_height = Height::new(
+                certificate
+                    .height
+                    .as_u64()
+                    .saturating_sub(self.prune_config.retain_heights),
+            );
+            info!(
+                "Pruning store enabled, retaining {} heights (keeping data from height {} onwards)",
+                self.prune_config.retain_heights,
+                retain_height.as_u64()
+            );
+            self.store.prune(retain_height).await?;
+        } else {
+            debug!("Pruning is disabled, skipping prune operation");
+        }
 
         // Move to next height
         self.current_height = self.current_height.increment();
@@ -410,8 +449,25 @@ impl State {
     }
 
     /// Returns the set of validators.
-    pub fn get_validator_set(&self) -> &ValidatorSet {
-        &self.genesis.validator_set
+    pub fn get_validator_set(&self, _height: Height) -> ValidatorSet {
+        return self.genesis.validator_set.clone();
+        // let num_validators = self.genesis.validator_set.len();
+        // let selection_size = num_validators.div_ceil(2);
+        //
+        // if num_validators <= selection_size {
+        //     return self.genesis.validator_set.clone();
+        // }
+        //
+        // ValidatorSet::new(
+        //     self.genesis
+        //         .validator_set
+        //         .iter()
+        //         .cycle()
+        //         .skip(height.as_u64() as usize % num_validators)
+        //         .take(selection_size)
+        //         .cloned()
+        //         .collect::<Vec<_>>(),
+        // )
     }
 
     /// Verifies the signature of the proposal.
@@ -444,7 +500,7 @@ impl State {
 
         // Retrieve the public key of the proposer
         let public_key = self
-            .get_validator_set()
+            .get_validator_set(self.current_height)
             .get_by_address(&parts.proposer)
             .map(|v| v.public_key);
 
@@ -492,7 +548,7 @@ fn assemble_value_from_parts(parts: ProposalParts) -> (ProposedValue<TestContext
     (proposed_value, data)
 }
 
-/// Decodes a Value from its byte representation using ProtobufCodec
-pub fn decode_value(bytes: Bytes) -> Value {
-    ProtobufCodec.decode(bytes).unwrap()
+/// Decodes a Value from its byte representation
+pub fn decode_value(bytes: Bytes) -> Option<Value> {
+    ProtobufCodec.decode(bytes).ok()
 }
