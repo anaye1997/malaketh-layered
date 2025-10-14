@@ -4,6 +4,7 @@ use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha3::Digest;
+use std::path::PathBuf;
 use tokio::time::Instant;
 use tracing::{debug, error, info};
 
@@ -12,11 +13,12 @@ use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity};
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
 
+use malachitebft_core_types::VotingPower;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{
     Address, Ed25519Provider, Genesis, Height, ProposalData, ProposalFin, ProposalInit,
-    ProposalPart, TestContext, ValidatorSet, Value,
+    ProposalPart, PublicKey, TestContext, ValidatorSet, Value,
 };
 
 use crate::app_config::PruneConfig;
@@ -35,7 +37,8 @@ const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
 pub struct State {
     #[allow(dead_code)]
     ctx: TestContext,
-    genesis: Genesis,
+    pub genesis: Genesis,
+    genesis_file: PathBuf,
     signing_provider: Ed25519Provider,
     address: Address,
     store: Store,
@@ -59,6 +62,9 @@ pub struct State {
     pub txs_count: u64,
     pub chain_bytes: u64,
     pub start_time: Instant,
+
+    // Dynamic validator set management
+    dynamic_validator_sets: std::collections::HashMap<Height, ValidatorSet>,
 }
 
 /// Represents errors that can occur during the verification of a proposal's signature.
@@ -90,6 +96,7 @@ impl State {
     /// Creates a new State instance with the given validator address and starting height
     pub fn new(
         genesis: Genesis,
+        genesis_file: PathBuf,
         ctx: TestContext,
         signing_provider: Ed25519Provider,
         address: Address,
@@ -99,6 +106,7 @@ impl State {
     ) -> Self {
         Self {
             genesis,
+            genesis_file,
             ctx,
             signing_provider,
             current_height: height,
@@ -117,6 +125,7 @@ impl State {
             txs_count: 0,
             chain_bytes: 0,
             start_time: Instant::now(),
+            dynamic_validator_sets: std::collections::HashMap::new(),
         }
     }
 
@@ -448,26 +457,87 @@ impl State {
         parts
     }
 
-    /// Returns the set of validators.
-    pub fn get_validator_set(&self, _height: Height) -> ValidatorSet {
-        return self.genesis.validator_set.clone();
-        // let num_validators = self.genesis.validator_set.len();
-        // let selection_size = num_validators.div_ceil(2);
-        //
-        // if num_validators <= selection_size {
-        //     return self.genesis.validator_set.clone();
-        // }
-        //
-        // ValidatorSet::new(
-        //     self.genesis
-        //         .validator_set
-        //         .iter()
-        //         .cycle()
-        //         .skip(height.as_u64() as usize % num_validators)
-        //         .take(selection_size)
-        //         .cloned()
-        //         .collect::<Vec<_>>(),
-        // )
+    /// get validator set from file
+    pub fn get_validator_set_from_file(&self) -> ValidatorSet {
+        let genesis_str = std::fs::read_to_string(&self.genesis_file).unwrap();
+        let genesis: Genesis = serde_json::from_str(&genesis_str).unwrap();
+        genesis.validator_set
+    }
+
+    /// Returns the latest validator set
+    pub fn get_latest_validator_set(&self) -> ValidatorSet {
+        self.genesis.validator_set.clone()
+    }
+    /// Returns the set of validators for a given height.
+    /// First checks dynamic validator sets, then falls back to genesis.
+    pub fn get_validator_set(&self, height: Height, epoch_lenght: u64) -> ValidatorSet {
+        // Check if we have a dynamic validator set for this height
+        // should get validator_set by height range(last_update_height ~ current_height)
+        // eg. epoch_lenght=100: 0~99 => height 0, 100~199 => height 100 ...
+        let store_height = if epoch_lenght == 0 {
+            height
+        } else {
+            Height::new((height.as_u64() / epoch_lenght) * epoch_lenght)
+        };
+        if let Some(validator_set) = self.dynamic_validator_sets.get(&store_height) {
+            return validator_set.clone();
+        }
+
+        self.get_validator_set_from_file()
+
+        // Fall back to genesis validator set
+        // self.genesis.validator_set.clone()
+    }
+
+    /// Updates the validator set for a specific height
+    pub fn update_validator_set(
+        &mut self,
+        height: Height,
+        validators: Vec<malachitebft_eth_types::Validator>,
+    ) {
+        let validator_set = ValidatorSet::new(validators);
+        self.dynamic_validator_sets
+            .insert(height, validator_set.clone());
+        self.genesis.validator_set = validator_set;
+    }
+
+    /// Creates a validator from address and voting power
+    /// This is a simplified implementation - in practice, you'd need to store/retrieve the public key
+    pub fn _create_validator_from_address(
+        &self,
+        address: Address,
+        voting_power: VotingPower,
+    ) -> malachitebft_eth_types::Validator {
+        // For now, we'll create a dummy public key based on the address
+        // In a real implementation, you'd need to store/retrieve the actual public key
+        let mut public_key_bytes = [0u8; 32];
+        public_key_bytes.copy_from_slice(&address.into_inner()[..20]);
+        // Pad with zeros to make it 32 bytes
+        for i in 20..32 {
+            public_key_bytes[i] = 0;
+        }
+
+        // Create a simple public key from bytes
+        let public_key = PublicKey::from_bytes(public_key_bytes);
+
+        malachitebft_eth_types::Validator::new(public_key, voting_power)
+    }
+
+    /// Creates a validator from contract data with real public key
+    pub fn create_validator_from_contract_data(
+        &self,
+        operator_address: Address,
+        voting_power: VotingPower,
+        public_key_bytes: [u8; 32],
+    ) -> malachitebft_eth_types::Validator {
+        // Create public key from the provided bytes
+        let public_key = PublicKey::from_bytes(public_key_bytes);
+
+        malachitebft_eth_types::Validator::new_with_operator_addr(
+            operator_address,
+            public_key,
+            voting_power,
+        )
     }
 
     /// Verifies the signature of the proposal.
@@ -499,8 +569,11 @@ impl State {
         let signature = signature.ok_or(SignatureVerificationError::MissingFinPart)?;
 
         // Retrieve the public key of the proposer
+        // Note: We need to get epoch_length from config in production
+        // For now, using a reasonable default value
+        let epoch_length = 100; // This should be passed from config
         let public_key = self
-            .get_validator_set(self.current_height)
+            .get_validator_set(self.current_height, epoch_length)
             .get_by_address(&parts.proposer)
             .map(|v| v.public_key);
 

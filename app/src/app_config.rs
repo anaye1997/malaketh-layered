@@ -22,6 +22,60 @@ impl Default for PruneConfig {
     }
 }
 
+/// Dynamic Validator Set configuration options
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DynamicValidatorSetConfig {
+    /// Whether dynamic validator set is enabled
+    pub enabled: bool,
+    /// Contract address for ValidatorSetManager
+    pub contract_address: Option<String>,
+    /// Update interval in seconds
+    pub update_interval_seconds: u64,
+    /// Epoch length in blocks
+    pub epoch_length_blocks: u64,
+    /// Minimum stake amount in wei
+    pub min_stake_amount: String,
+    /// Whether slashing is enabled
+    pub slashing_enabled: bool,
+    /// Whether fee distribution is enabled
+    pub fee_distribution_enabled: bool,
+}
+
+impl Default for DynamicValidatorSetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contract_address: None,
+            update_interval_seconds: 30,
+            epoch_length_blocks: 100,
+            min_stake_amount: "1000000000000000000".to_string(), // 1 ETH
+            slashing_enabled: true,
+            fee_distribution_enabled: true,
+        }
+    }
+}
+
+impl DynamicValidatorSetConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.contract_address.is_none() {
+            return Err("contract_address is required when dynamic validator set is enabled".to_string());
+        }
+        if self.epoch_length_blocks == 0 {
+            return Err("epoch_length_blocks must be greater than 0".to_string());
+        }
+        if self.update_interval_seconds == 0 {
+            return Err("update_interval_seconds must be greater than 0".to_string());
+        }
+        if let Some(addr) = &self.contract_address {
+            if !addr.starts_with("0x") || addr.len() != 42 {
+                return Err(format!("Invalid contract address format: {}", addr));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Extra Malachite configuration options
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -34,6 +88,8 @@ pub struct EngineConfig {
     /// block interval time
     #[serde(with = "humantime_serde")]
     pub block_interval: Duration,
+    /// Dynamic validator set configuration
+    pub dynamic_validator_set: DynamicValidatorSetConfig,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +99,7 @@ impl Default for EngineConfig {
             eth_url: "http://localhost:8545".to_string(),
             wt_path: "./assets/jwtsecret".to_string(),
             block_interval: Duration::from_millis(1000),
+            dynamic_validator_set: DynamicValidatorSetConfig::default(),
         }
     }
 }

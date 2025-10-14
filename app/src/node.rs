@@ -26,6 +26,7 @@ use crate::app_config::{load_config, Config};
 use crate::metrics::DbMetrics;
 use crate::state::State;
 use crate::store::Store;
+use alloy_primitives::Address as AlloyAddress;
 use malachitebft_eth_cli::metrics;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{
@@ -162,6 +163,7 @@ impl Node for App {
         // Use prune configuration from config file
         let mut state = State::new(
             genesis,
+            self.genesis_file.clone(),
             ctx,
             signing_provider,
             address,
@@ -224,12 +226,32 @@ impl Node for App {
 
         let app_handle = tokio::spawn(
             async move {
+                // Validate dynamic validator set configuration
+                if let Err(e) = config.engine.dynamic_validator_set.validate() {
+                    tracing::error!("Invalid dynamic validator set configuration: {}", e);
+                    return;
+                }
+
+                // Parse validator set contract address
+                let validator_set_contract_address = if config.engine.dynamic_validator_set.enabled
+                {
+                    config
+                        .engine
+                        .dynamic_validator_set
+                        .contract_address
+                        .as_ref()
+                        .and_then(|addr| AlloyAddress::from_str(addr).ok().map(Address::from))
+                } else {
+                    None
+                };
+
                 if let Err(e) = crate::app::run(
                     &mut state,
                     &mut channels,
                     engine,
                     config.engine.block_interval,
                     shutdown_rx,
+                    validator_set_contract_address,
                 )
                 .await
                 {

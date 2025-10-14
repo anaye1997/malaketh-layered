@@ -2,7 +2,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{self, eyre};
 use ssz::{Decode, Encode};
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use malachitebft_app_channel::app::engine::host::Next;
@@ -15,10 +15,11 @@ use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
-use malachitebft_eth_types::{Block, BlockHash, TestContext, Height};
+use malachitebft_eth_types::{Address, Block, BlockHash, Height, TestContext};
 use tokio::sync::mpsc::Receiver;
 
 use crate::state::{decode_value, State};
+use malachitebft_eth_engine::validator_set_manager::DynamicValidatorSetManager;
 
 pub async fn run(
     state: &mut State,
@@ -26,13 +27,31 @@ pub async fn run(
     engine: Engine,
     block_interval: Duration,
     mut shutdown_rx: Receiver<()>,
+    validator_set_contract_address: Option<Address>,
 ) -> eyre::Result<()> {
+    // Initialize dynamic validator set manager
+    let mut validator_set_manager = if let Some(contract_addr) = validator_set_contract_address {
+        info!(
+            "Initializing dynamic validator set manager with contract: {}",
+            contract_addr
+        );
+        let mut manager = DynamicValidatorSetManager::new(
+            engine.eth.clone(),
+            contract_addr,
+            Duration::from_secs(30), // 30 second update interval
+        )
+        .with_genesis_validator_set(state.genesis.validator_set.clone());
+        manager.initialize().await?;
+        Some(manager)
+    } else {
+        info!("Using static validator set from genesis");
+        None
+    };
+
     let mut shutdown_flag = false;
     while !shutdown_flag {
         tokio::select! {
             Some(msg) = channels.consensus.recv() => {
-                debug!("metis-test:consensus-chan recv!!! msg:{:?}", msg);
-
                 match msg {
                     // The first message to handle is the `ConsensusReady` message, signaling to the app
                     // that Malachite is ready to start consensus
@@ -60,8 +79,9 @@ pub async fn run(
 
                         // We can simply respond by telling the engine to start consensus
                         // at the current height, which is initially 1
+                        let epoch_length = validator_set_manager.as_ref().map(|m| m.get_epoch_length_value()).unwrap();
                         if reply.send(
-                            (state.current_height, state.get_validator_set(state.current_height).clone())
+                            (state.current_height, state.get_validator_set(state.current_height, epoch_length).clone())
                         ).is_err()
                         {
                             error!("Failed to send ConsensusReady reply");
@@ -106,7 +126,14 @@ pub async fn run(
                         // propose. Then we send it back to consensus.
                         let latest_block = state.latest_block.expect("Head block hash is not set");
                         let proposer = state.current_proposer.expect("Head block hash is not set");
-                        let execution_payload = engine.generate_block(&latest_block, proposer).await?;
+
+                        // Get the operator address for the proposer (consensus address)
+                        let epoch_length = validator_set_manager.as_ref().map(|m| m.get_epoch_length_value()).unwrap();
+                        let validator_set = state.get_validator_set(state.current_height, epoch_length);
+                        let validator = validator_set.get_by_address(&proposer).expect("Proposer should be in validator set");
+
+
+                        let execution_payload = engine.generate_block(&latest_block,  validator.operator_address).await?;
                         debug!("🌈 Got execution payload: {:?}", execution_payload);
 
                         // Store block in state and propagate to peers.
@@ -168,10 +195,11 @@ pub async fn run(
                     // than the one we are at (e.g. because we are lagging behind a little bit),
                     // the engine may ask us for the validator set at that height.
                     //
-                    // In our case, our validator set stays constant between heights so we can
-                    // send back the validator set found in our genesis state.
+                    // Check if we need to update validator set from contract
                     AppMsg::GetValidatorSet { height, reply } => {
-                        if reply.send(Some(state.get_validator_set(height).clone())).is_err() {
+                        let epoch_length = validator_set_manager.as_ref().map(|m| m.get_epoch_length_value()).unwrap();
+                        let validator_set = state.get_validator_set(height, epoch_length).clone();
+                        if reply.send(Some(validator_set)).is_err() {
                             error!("🔴 Failed to send GetValidatorSet reply");
                         }
                     }
@@ -280,11 +308,16 @@ pub async fn run(
                             prev_randao: new_block_prev_randao,
                         });
 
+                        // Update validator set if needed
+                        if let Some(ref mut manager) = validator_set_manager {
+                            update_validator_set(manager, state, height).await?;
+                        };
+
                         // And then we instruct consensus to start the next height
                         if reply
                             .send(Next::Start(
                                 state.current_height,
-                                state.get_validator_set(state.current_height).clone(),
+                                state.get_latest_validator_set().clone(),
                             ))
                             .is_err()
                         {
@@ -388,4 +421,36 @@ pub async fn run(
     // from consensus has been closed, meaning that the consensus actor has died.
     // We can do nothing but return an error here.
     Err(eyre!("Consensus channel closed unexpectedly"))
+}
+
+pub async fn update_validator_set(
+    manager: &mut DynamicValidatorSetManager,
+    state: &mut State,
+    height: Height,
+) -> eyre::Result<()> {
+    // Check if validator set needs to be updated
+    if manager.should_update_validator_set(height.as_u64()).await {
+        match manager.update_validator_set(height.as_u64()).await {
+            Ok(validators) => {
+                // Convert validators from contract to Malachite format
+                let mut converted_validators = Vec::new();
+                for validator in validators {
+                    // Use real public key obtained from contract
+                    converted_validators.push(state.create_validator_from_contract_data(
+                        validator.operator_address,
+                        validator.voting_power,
+                        validator.public_key,
+                    ));
+                }
+                state.update_validator_set(height, converted_validators);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to update validator set from contract: {}, using cached set",
+                    e
+                );
+            }
+        }
+    }
+    Ok(())
 }
