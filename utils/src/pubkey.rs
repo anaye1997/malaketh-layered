@@ -2,6 +2,7 @@ use crate::PubkeyCmd;
 use color_eyre::eyre::Result;
 use ed25519_consensus::SigningKey;
 use serde::Deserialize;
+use sha3::{Digest, Keccak256};
 use std::fs;
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,15 @@ pub fn run_pubkey(cmd: PubkeyCmd) -> Result<()> {
         sk.verification_key().to_bytes()
     };
 
-    println!("0x{}", hex::encode(pk32));
+    // PubKey hex
+    let pk_hex = format!("0x{}", hex::encode(pk32));
+
+    // Derive address per project types::Address::from_public_key:
+    // address = first 20 bytes of Keccak256(pubkey)
+    let hash = Keccak256::digest(&pk32);
+    let addr_hex = format!("0x{}", hex::encode(&hash[..20]));
+
+    println!("{}", pk_hex);
+    println!("{}", addr_hex);
     Ok(())
 }
